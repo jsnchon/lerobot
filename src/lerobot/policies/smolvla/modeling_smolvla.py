@@ -569,7 +569,7 @@ class VLAFlowMatching(nn.Module):
     └──────────────────────────────┘
     """
 
-    def __init__(self, config: SmolVLAConfig, rtc_processor: RTCProcessor | None = None):
+    def __init__(self, config: SmolVLAConfig, rtc_processor: RTCProcessor | None = None, init_log_std=-3):
         super().__init__()
         self.config = config
 
@@ -590,7 +590,8 @@ class VLAFlowMatching(nn.Module):
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
         # no need for separate mean head. Final denoised action will be used as mean vector for action distribution
         self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
-        self.log_std_head = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
+        # use log_std for smoother scaling and so don't have to deal with positive clamping
+        self.log_std = nn.Parameter(torch.ones(1, 1, self.config.max_action_dim) * init_log_std)
 
         self.action_time_mlp_in = nn.Linear(
             self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
@@ -865,7 +866,7 @@ class VLAFlowMatching(nn.Module):
                 prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
                 execution_horizon = kwargs.get("execution_horizon")
 
-                v_t, log_std = self.rtc_processor.denoise_step(
+                v_t = self.rtc_processor.denoise_step(
                     x_t=x_t,
                     prev_chunk_left_over=prev_chunk_left_over,
                     inference_delay=inference_delay,
@@ -874,7 +875,7 @@ class VLAFlowMatching(nn.Module):
                     execution_horizon=execution_horizon,
                 )
             else:
-                v_t, log_std = denoise_step_partial_call(x_t)
+                v_t = denoise_step_partial_call(x_t)
 
             # Euler step
             x_t += dt * v_t
@@ -885,8 +886,10 @@ class VLAFlowMatching(nn.Module):
 
             time += dt
 
-        # by last denoise step, log_std will be output from running final action expert hidden state through log std head
-        return x_t, log_std 
+        batch_size = x_t.shape[0]
+        chunk_size = x_t.shape[1]
+        log_std = self.log_std.expand(batch_size, chunk_size, -1) # log_std vector is same for everything in this inference step
+        return x_t, log_std
 
     def denoise_step(
         self,
@@ -921,5 +924,4 @@ class VLAFlowMatching(nn.Module):
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
-        logstd = self.log_std_head(suffix_out)
-        return v_t, logstd
+        return v_t
