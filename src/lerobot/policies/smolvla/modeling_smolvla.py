@@ -287,7 +287,7 @@ class SmolVLAPolicy(PreTrainedPolicy):
         lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
         lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
 
-        actions = self.model.sample_actions(
+        actions, _ = self.model.sample_actions(
             images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
         )
 
@@ -299,6 +299,33 @@ class SmolVLAPolicy(PreTrainedPolicy):
             actions = self._pi_aloha_encode_actions(actions)
 
         return actions
+
+    # GRPO function
+    def _get_distr_params_chunk(
+        self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs: Unpack[ActionSelectKwargs]
+    ) -> tuple[Tensor, Tensor]:
+        for k in batch:
+            if k in self._queues and k != ACTION:
+                batch[k] = torch.stack(list(self._queues[k]), dim=1)
+
+        images, img_masks = self.prepare_images(batch)
+        state = self.prepare_state(batch)
+        lang_tokens = batch[f"{OBS_LANGUAGE_TOKENS}"]
+        lang_masks = batch[f"{OBS_LANGUAGE_ATTENTION_MASK}"]
+
+        means, log_stds = self.model.sample_actions(
+            images, img_masks, lang_tokens, lang_masks, state, noise=noise, **kwargs
+        )
+
+        # Unpad actions
+        original_action_dim = self.config.action_feature.shape[0]
+        means = means[:, :, :original_action_dim]
+        log_stds = log_stds[:, :, :original_action_dim]
+
+        if self.config.adapt_to_pi_aloha:
+            raise RuntimeError("This should only be used with LIBERO")
+
+        return means, log_stds
 
     def _prepare_batch(self, batch: dict[str, Tensor]) -> dict[str, Tensor]:
         if self.config.adapt_to_pi_aloha:
@@ -345,6 +372,35 @@ class SmolVLAPolicy(PreTrainedPolicy):
             self._queues[ACTION].extend(actions.transpose(0, 1)[: self.config.n_action_steps])
 
         return self._queues[ACTION].popleft()
+
+    # GRPO function
+    def select_action_distr_params(
+        self, batch: dict[str, Tensor], noise: Tensor | None = None, **kwargs: Unpack[ActionSelectKwargs]
+    ) -> Tensor:
+        """Select paramaters for a single action DISTRIBUTION given environment observations.
+
+        The action tensor is treated instead as a tensor of means for a diagonal Gaussian. The log standard deviations of
+        these distributions are determined by a separate head whose input is the model's final hidden state.
+
+        This uses the same queue system as selecting deterministic actions to take advantage of chunking
+        """
+
+        assert not self._rtc_enabled(), (
+            "RTC is not supported for select_action, use it with predict_action_chunk"
+        )
+
+        batch = self._prepare_batch(batch)
+        self.distr_queue = deque()
+
+        if len(self.distr_queue) == 0:
+            means, log_stds = self._get_distr_params_chunk(batch, noise)
+            # ensure n_action_steps dimension is first since we want to split along chunk dimension
+            means = means.transpose(0, 1) 
+            log_stds = log_stds.transpose(0, 1)
+            # zip everything into an iterable of (mean, log_std) tuples for each time step, then extend the queue with that
+            self.distr_queue.extend(zip(means, log_stds))
+
+        return self.distr_queue.popleft()
 
     def _check_get_actions_condition(self) -> bool:
         return len(self._queues[ACTION]) == 0
@@ -532,7 +588,9 @@ class VLAFlowMatching(nn.Module):
             self.config.max_state_dim, self.vlm_with_expert.config.text_config.hidden_size
         )
         self.action_in_proj = nn.Linear(self.config.max_action_dim, self.vlm_with_expert.expert_hidden_size)
+        # no need for separate mean head. Final denoised action will be used as mean vector for action distribution
         self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
+        self.log_std_head = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
 
         self.action_time_mlp_in = nn.Linear(
             self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
@@ -807,7 +865,7 @@ class VLAFlowMatching(nn.Module):
                 prev_chunk_left_over = kwargs.get("prev_chunk_left_over")
                 execution_horizon = kwargs.get("execution_horizon")
 
-                v_t = self.rtc_processor.denoise_step(
+                v_t, log_std = self.rtc_processor.denoise_step(
                     x_t=x_t,
                     prev_chunk_left_over=prev_chunk_left_over,
                     inference_delay=inference_delay,
@@ -816,7 +874,7 @@ class VLAFlowMatching(nn.Module):
                     execution_horizon=execution_horizon,
                 )
             else:
-                v_t = denoise_step_partial_call(x_t)
+                v_t, log_std = denoise_step_partial_call(x_t)
 
             # Euler step
             x_t += dt * v_t
@@ -827,7 +885,8 @@ class VLAFlowMatching(nn.Module):
 
             time += dt
 
-        return x_t
+        # by last denoise step, log_std will be output from running final action expert hidden state through log std head
+        return x_t, log_std 
 
     def denoise_step(
         self,
@@ -862,4 +921,5 @@ class VLAFlowMatching(nn.Module):
         suffix_out = suffix_out[:, -self.config.chunk_size :]
         suffix_out = suffix_out.to(dtype=torch.float32)
         v_t = self.action_out_proj(suffix_out)
-        return v_t
+        logstd = self.log_std_head(suffix_out)
+        return v_t, logstd
