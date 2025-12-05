@@ -592,6 +592,8 @@ class VLAFlowMatching(nn.Module):
         self.action_out_proj = nn.Linear(self.vlm_with_expert.expert_hidden_size, self.config.max_action_dim)
         # use log_std for smoother scaling and so don't have to deal with positive clamping
         self.log_std = nn.Parameter(torch.ones(1, 1, self.config.max_action_dim) * init_log_std)
+        # if set to a number, this will be used in noising inference
+        self.euler_step_noise_std = None
 
         self.action_time_mlp_in = nn.Linear(
             self.vlm_with_expert.expert_hidden_size * 2, self.vlm_with_expert.expert_hidden_size
@@ -877,6 +879,8 @@ class VLAFlowMatching(nn.Module):
             else:
                 v_t = denoise_step_partial_call(x_t)
 
+            if self.euler_step_noise_std:
+                v_t = v_t + torch.randn_like(v_t) * self.euler_step_noise_std
             # Euler step
             x_t += dt * v_t
 
